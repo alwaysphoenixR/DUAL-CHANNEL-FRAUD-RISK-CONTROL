@@ -1,0 +1,12 @@
+
+.venv/
+__pycache__/
+*.pyc
+
+data/raw/
+data/cached_streams/
+
+.env
+kaggle.json
+.ipynb_checkpoints/
+.pytest_cache/
