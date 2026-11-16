@@ -1,4 +1,4 @@
-r"""Latency-Aware Risk Control (LARC) calibration and triage layer."""
+r"""Latency-Aware Risk Control (LARC) calibration and water-filling triage layer."""
 
 import numpy as np
 
@@ -8,7 +8,7 @@ class LARCCalibrationLayer:
     Implements Zi, Wang, & Zhang (2026) LARC layer:
       1. 99th-percentile tail exposure cap A_cap routed to mandatory review.
       2. Value-ordered triage score g(x, a) = p_hat * (a + c_cb).
-      3. K = 5 quantile amount strata with monotone conformal risk thresholds \tau_k(\alpha').
+      3. K = 5 quantile amount strata with water-filling conformal risk thresholds \tau_k(\alpha').
     """
 
     def __init__(self, n_strata: int = 5, cap_percentile: float = 99.0, c_cb: float = 15.0):
@@ -23,6 +23,7 @@ class LARCCalibrationLayer:
         self._cum_risk: list[np.ndarray] = []
         self._stratum_counts: np.ndarray = np.zeros(n_strata, dtype=np.int64)
         self._b_max_stratum: np.ndarray = np.ones(n_strata, dtype=np.float64)
+        self._n_cal_total: int = 1
 
     def compute_triage_score(self, amounts: np.ndarray, p_hat: np.ndarray) -> np.ndarray:
         r"""Computes value-ordered triage index g_t = \hat{p}_t * (a_t + c_cb)."""
@@ -61,6 +62,7 @@ class LARCCalibrationLayer:
         )
 
         in_cap = amt <= self.a_cap
+        self._n_cal_total = max(1, int(np.sum(in_cap)))
         quantiles = np.linspace(0.0, 1.0, self.n_strata + 1)
         self.stratum_edges = np.quantile(amt[in_cap], quantiles)
         self.stratum_edges[0] = 0.0
@@ -75,12 +77,11 @@ class LARCCalibrationLayer:
         self._stratum_counts = np.zeros(self.n_strata, dtype=np.int64)
         self._b_max_stratum = np.zeros(self.n_strata, dtype=np.float64)
 
-        total_in_cap = max(1, int(np.sum(in_cap)))
         for k in range(self.n_strata):
             mask_k = strata == k
             n_k = int(np.sum(mask_k))
             self._stratum_counts[k] = n_k
-            self.p_strata[k] = n_k / total_in_cap
+            self.p_strata[k] = n_k / self._n_cal_total
             b_k = float(self.stratum_edges[k + 1] / self.a_bar)
             self._b_max_stratum[k] = b_k
 
@@ -93,37 +94,51 @@ class LARCCalibrationLayer:
             g_k = g_scores[mask_k][order]
             loss_k = norm_losses[mask_k][order]
 
-            cum_loss = (np.cumsum(loss_k) + b_k) / (n_k + 1.0)
+            # Global conformal finite-sample slack scaled by total anchor size N_cal
+            slack_k = b_k / (self._n_cal_total + 1.0)
+            cum_loss = (np.cumsum(loss_k) / max(1.0, float(n_k))) + slack_k
             self._sorted_g.append(g_k)
             self._cum_risk.append(cum_loss)
 
     def get_thresholds(self, nominal_alpha: float) -> np.ndarray:
         r"""
-        Returns stratum approval thresholds [\tau_0(\alpha'), ..., \tau_{K-1}(\alpha')].
-        Auto-approve iff a_t <= A_cap and g_t < \tau_k(\alpha').
-        Monotonically non-decreasing in nominal_alpha.
+        Returns water-filling stratum approval thresholds [\tau_0(\alpha'), ..., \tau_{K-1}(\alpha')].
+        Unused risk budget from low-amount strata is carried forward to higher-amount strata,
+        while preserving strict monotonicity in nominal_alpha.
         """
         alpha_val = max(0.0, float(nominal_alpha))
         thresholds = np.zeros(self.n_strata, dtype=np.float64)
 
+        rem_budget = alpha_val
+        rem_prob = 1.0
+
         for k in range(self.n_strata):
             g_k = self._sorted_g[k]
             risk_k = self._cum_risk[k]
-            b_k = self._b_max_stratum[k]
+            p_k = float(self.p_strata[k])
             n_k = self._stratum_counts[k]
 
-            if n_k == 0 or alpha_val <= b_k / (n_k + 1.0):
+            if n_k == 0 or p_k <= 0.0:
                 thresholds[k] = 0.0
                 continue
 
-            idx = int(np.searchsorted(risk_k, alpha_val, side="right")) - 1
-            if idx < 0:
+            target_k = rem_budget / max(rem_prob, 1e-9)
+            max_risk_k = float(risk_k[-1])
+
+            if target_k <= float(risk_k[0]):
                 thresholds[k] = 0.0
-            elif idx >= len(g_k) - 1:
-                excess_ratio = alpha_val / max(risk_k[-1], 1e-12)
-                thresholds[k] = float(g_k[-1]) * max(1.0, excess_ratio)
+                realized_k = 0.0
+            elif max_risk_k <= target_k:
+                excess_ratio = target_k / max(max_risk_k, 1e-12)
+                thresholds[k] = float(g_k[-1]) * max(1.01, excess_ratio)
+                realized_k = max_risk_k
             else:
-                thresholds[k] = float(g_k[idx + 1])
+                idx = int(np.searchsorted(risk_k, target_k, side="right")) - 1
+                thresholds[k] = float(g_k[min(idx + 1, len(g_k) - 1)])
+                realized_k = float(risk_k[idx])
+
+            rem_budget = max(0.0, rem_budget - p_k * realized_k)
+            rem_prob = max(1e-9, rem_prob - p_k)
 
         return thresholds
 
